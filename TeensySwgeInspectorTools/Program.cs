@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Text;
 using Microsoft.IO;
 
 namespace TeensySwgeInspectorTools;
@@ -36,7 +37,7 @@ public class PcapFile
             oflags |= 2;
 
         var payload = Payload(oflags, channel, rssiNegative, eventCount, timeDelta, packet);
-        
+
         _writer.Write(timestampSeconds);
         _writer.Write(timestampUs);
         _writer.Write(payload.Length);
@@ -76,7 +77,7 @@ public class PcapFile
     }
 }
 
-public enum PacketTag : byte
+public enum RadioPacketTag : byte
 {
     Data = 0,
     MsgResetComplete = 0x40,
@@ -91,9 +92,18 @@ public enum PacketTag : byte
     CmdSniffChannel = 0x82,
 }
 
-public record PacketHeader(PacketTag Tag, ushort Length)
+public enum DevicePacketType
 {
-    public static PacketHeader Read(BinaryReader r) => new((PacketTag)r.ReadByte(), r.ReadUInt16());
+    SystemTimestamp = 0x00,
+    NmeaSentence = 0x01,
+    RadioPacket37 = 0x02,
+    RadioPacket38 = 0x03,
+    RadioPacket39 = 0x04,
+}
+
+public record PacketHeader(RadioPacketTag Tag, ushort Length)
+{
+    public static PacketHeader Read(BinaryReader r) => new((RadioPacketTag)r.ReadByte(), r.ReadUInt16());
 }
 
 public record RadioData(uint Timestamp, byte Channel, byte Flags, byte RssiNegative, uint AdvertisingAddress)
@@ -115,38 +125,61 @@ class Program
 {
     public static void Main(string[] args)
     {
-        using var pcapStream = File.OpenWrite("/home/cnewman/Desktop/0001.pcap");
+        using var pcapStream = File.OpenWrite("/home/cnewman/Desktop/0002.pcap");
         var pcap = new PcapFile(pcapStream);
         pcap.WriteHeader();
 
-        using var fs = File.OpenRead("/home/cnewman/Desktop/0001.bin");
+        using var fs = File.OpenRead("/home/cnewman/Desktop/0002.bin");
         var br = new BinaryReader(fs);
 
         var eventCount = 0;
 
         var prevTimestamp = 0u;
         var timestampShift = 0L;
-        
+
         while (fs.Position < fs.Length)
         {
-            var timestampMillis = br.ReadUInt32();
-            
-            var header = PacketHeader.Read(br);
-            var radioData = RadioData.Read(br);
+            var packetType = (DevicePacketType)br.ReadByte();
+            switch (packetType)
+            {
+                case DevicePacketType.SystemTimestamp:
+                {
+                    var timestampMillis = br.ReadUInt32();
+                    Console.WriteLine($"System time: {timestampMillis}");
+                    break;
+                }
+                case DevicePacketType.NmeaSentence:
+                {
+                    var sentenceLength = br.ReadByte();
+                    var sentence = Encoding.ASCII.GetString(br.ReadBytes(sentenceLength));
+                    Console.WriteLine(sentence);
+                    break;
+                }
+                case DevicePacketType.RadioPacket37:
+                case DevicePacketType.RadioPacket38:
+                case DevicePacketType.RadioPacket39:
+                {
+                    var header = PacketHeader.Read(br);
+                    var radioData = RadioData.Read(br);
 
-            fs.Seek(-12, SeekOrigin.Current);
-            var packetData = br.ReadBytes(header.Length);
+                    fs.Seek(-12, SeekOrigin.Current);
+                    var packetData = br.ReadBytes(header.Length);
 
-            // detect and correct 32-bit microsecond timer overflow (roughly every 1:11:35)
-            if (prevTimestamp > radioData.Timestamp)
-                timestampShift += uint.MaxValue;
+                    // detect and correct 32-bit microsecond timer overflow (roughly every 1:11:35)
+                    if (prevTimestamp > radioData.Timestamp)
+                        timestampShift += uint.MaxValue;
 
-            var tsSec = (uint)((timestampShift + radioData.Timestamp) / 1000000);
-            var tsUsec = (uint)((timestampShift + radioData.Timestamp) % 1000000);
+                    var tsSec = (uint)((timestampShift + radioData.Timestamp) / 1000000);
+                    var tsUsec = (uint)((timestampShift + radioData.Timestamp) % 1000000);
 
-            prevTimestamp = radioData.Timestamp;
-            
-            pcap.WriteBlePacket(tsSec, tsUsec, radioData.Flags, radioData.Channel, radioData.RssiNegative, eventCount, 0, packetData[8..]);
+                    prevTimestamp = radioData.Timestamp;
+
+                    pcap.WriteBlePacket(tsSec, tsUsec, radioData.Flags, radioData.Channel, radioData.RssiNegative, eventCount, 0, packetData[8..]);
+                    break;
+                }
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
 
             eventCount++;
         }
