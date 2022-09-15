@@ -133,9 +133,12 @@ class Program
         var br = new BinaryReader(fs);
 
         var eventCount = 0;
+        var gpsCount = 0;
 
-        var prevTimestamp = 0u;
-        var timestampShift = 0L;
+        var prevTimestamp = new uint[3];
+        var timestampShift = new long[3];
+
+        var manager = new RecyclableMemoryStreamManager();
 
         while (fs.Position < fs.Length)
         {
@@ -145,36 +148,50 @@ class Program
                 case DevicePacketType.SystemTimestamp:
                 {
                     var timestampMillis = br.ReadUInt32();
-                    Console.WriteLine($"System time: {timestampMillis}");
                     break;
                 }
                 case DevicePacketType.NmeaSentence:
                 {
                     var sentenceLength = br.ReadByte();
-                    var sentence = Encoding.ASCII.GetString(br.ReadBytes(sentenceLength));
-                    Console.WriteLine(sentence);
+                    var sentence = Encoding.ASCII.GetString(br.ReadBytes(sentenceLength)).Trim();
+                    // Console.WriteLine(sentence);
+                    gpsCount++;
                     break;
                 }
                 case DevicePacketType.RadioPacket37:
                 case DevicePacketType.RadioPacket38:
                 case DevicePacketType.RadioPacket39:
                 {
-                    var header = PacketHeader.Read(br);
-                    var radioData = RadioData.Read(br);
+                    var packetLength = br.ReadInt32();
+                    using var ms = manager.GetStream(br.ReadBytes(packetLength));
+                    var packetReader = new BinaryReader(ms);
 
-                    fs.Seek(-12, SeekOrigin.Current);
-                    var packetData = br.ReadBytes(header.Length);
+                    try
+                    {
+                        var header = PacketHeader.Read(packetReader);
+                        if (header.Tag != RadioPacketTag.Data)
+                            break;
+                        var radioData = RadioData.Read(packetReader);
 
-                    // detect and correct 32-bit microsecond timer overflow (roughly every 1:11:35)
-                    if (prevTimestamp > radioData.Timestamp)
-                        timestampShift += uint.MaxValue;
+                        ms.Seek(-12, SeekOrigin.Current);
+                        var packetData = packetReader.ReadBytes(header.Length);
 
-                    var tsSec = (uint)((timestampShift + radioData.Timestamp) / 1000000);
-                    var tsUsec = (uint)((timestampShift + radioData.Timestamp) % 1000000);
+                        // detect and correct 32-bit microsecond timer overflow (roughly every 1:11:35)
+                        if (prevTimestamp[radioData.Channel - 37] > radioData.Timestamp &&
+                            prevTimestamp[radioData.Channel - 37] - radioData.Timestamp > 1000000)
+                            timestampShift[radioData.Channel - 37] += uint.MaxValue;
 
-                    prevTimestamp = radioData.Timestamp;
+                        var tsSec = (uint)((timestampShift[radioData.Channel - 37] + radioData.Timestamp) / 1000000);
+                        var tsUsec = (uint)((timestampShift[radioData.Channel - 37] + radioData.Timestamp) % 1000000);
 
-                    pcap.WriteBlePacket(tsSec, tsUsec, radioData.Flags, radioData.Channel, radioData.RssiNegative, eventCount, 0, packetData[8..]);
+                        prevTimestamp[radioData.Channel - 37] = radioData.Timestamp;
+
+                        pcap.WriteBlePacket(tsSec, tsUsec, radioData.Flags, radioData.Channel, radioData.RssiNegative, eventCount, 0, packetData[8..]);
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        // ignored
+                    }
                     break;
                 }
                 default:
@@ -183,5 +200,7 @@ class Program
 
             eventCount++;
         }
+        
+        Console.WriteLine($"{gpsCount} GPS sentences");
     }
 }
