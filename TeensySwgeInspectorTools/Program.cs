@@ -125,18 +125,18 @@ class Program
 {
     public static void Main(string[] args)
     {
-        using var pcapStream = File.OpenWrite("/home/cnewman/Desktop/0002.pcap");
+        using var pcapStream = File.OpenWrite("/home/cnewman/Desktop/0001.pcap");
         var pcap = new PcapFile(pcapStream);
         pcap.WriteHeader();
 
-        using var fs = File.OpenRead("/home/cnewman/Desktop/0002.bin");
+        using var fs = File.OpenRead("/home/cnewman/Desktop/0001.bin");
         var br = new BinaryReader(fs);
 
         var eventCount = 0;
         var gpsCount = 0;
 
-        var prevTimestamp = new uint[3];
-        var timestampShift = new long[3];
+        // var prevTimestamp = new uint[3];
+        // var timestampShift = new long[3];
 
         var manager = new RecyclableMemoryStreamManager();
 
@@ -148,10 +148,13 @@ class Program
                 case DevicePacketType.SystemTimestamp:
                 {
                     var timestampMillis = br.ReadUInt32();
+                    var timestampMicrosFraction = br.ReadUInt16();
                     break;
                 }
                 case DevicePacketType.NmeaSentence:
                 {
+                    var timestampMillis = br.ReadUInt32();
+                    var timestampMicrosFraction = br.ReadUInt16();
                     var sentenceLength = br.ReadByte();
                     var sentence = Encoding.ASCII.GetString(br.ReadBytes(sentenceLength)).Trim();
                     // Console.WriteLine(sentence);
@@ -162,6 +165,14 @@ class Program
                 case DevicePacketType.RadioPacket38:
                 case DevicePacketType.RadioPacket39:
                 {
+                    var timestampMillis = (ulong)br.ReadUInt32();
+                    var timestampMicrosFraction = (ulong)br.ReadUInt16();
+
+                    // Technically this isn't "absolute" time as the 32-bit microsecond timer
+                    // will overflow at a nonzero fraction and we'll drift backwards in time
+                    // by 296 microseconds per overflow period (roughly every 1:11:35)
+                    var microsTimestamp = timestampMillis * 1000 + timestampMicrosFraction;
+                    
                     var packetLength = br.ReadInt32();
                     using var ms = manager.GetStream(br.ReadBytes(packetLength));
                     var packetReader = new BinaryReader(ms);
@@ -169,7 +180,8 @@ class Program
                     try
                     {
                         var header = PacketHeader.Read(packetReader);
-                        if (header.Tag != RadioPacketTag.Data)
+                        // Skip non-data packets and packets that are probably corrupt
+                        if (header.Tag != RadioPacketTag.Data || header.Length > 256)
                             break;
                         var radioData = RadioData.Read(packetReader);
 
@@ -177,16 +189,16 @@ class Program
                         var packetData = packetReader.ReadBytes(header.Length);
 
                         // detect and correct 32-bit microsecond timer overflow (roughly every 1:11:35)
-                        if (prevTimestamp[radioData.Channel - 37] > radioData.Timestamp &&
-                            prevTimestamp[radioData.Channel - 37] - radioData.Timestamp > 1000000)
-                            timestampShift[radioData.Channel - 37] += uint.MaxValue;
+                        // if (prevTimestamp[radioData.Channel - 37] > radioData.Timestamp)
+                        //     timestampShift[radioData.Channel - 37] += uint.MaxValue;
 
-                        var tsSec = (uint)((timestampShift[radioData.Channel - 37] + radioData.Timestamp) / 1000000);
-                        var tsUsec = (uint)((timestampShift[radioData.Channel - 37] + radioData.Timestamp) % 1000000);
+                        var tsSec = (uint)(microsTimestamp / 1000000);
+                        var tsUsec = (uint)(microsTimestamp % 1000000);
 
-                        prevTimestamp[radioData.Channel - 37] = radioData.Timestamp;
+                        // prevTimestamp[radioData.Channel - 37] = radioData.Timestamp;
 
                         pcap.WriteBlePacket(tsSec, tsUsec, radioData.Flags, radioData.Channel, radioData.RssiNegative, eventCount, 0, packetData[8..]);
+                        eventCount++;
                     }
                     catch (EndOfStreamException)
                     {
@@ -197,8 +209,6 @@ class Program
                 default:
                     throw new ArgumentOutOfRangeException();
             }
-
-            eventCount++;
         }
         
         Console.WriteLine($"{gpsCount} GPS sentences");
